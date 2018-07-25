@@ -19,6 +19,8 @@ You do not need to install them into your project.
 """
 load("//internal/common:collect_es6_sources.bzl", "collect_es6_sources")
 load("//internal/common:module_mappings.bzl", "get_module_mappings")
+load("//internal/node:node.bzl",
+     _nodejs_binary = "nodejs_binary_macro")
 
 _ROLLUP_MODULE_MAPPINGS_ATTR = "rollup_module_mappings"
 
@@ -45,9 +47,11 @@ def write_rollup_config(ctx, plugins=[], root_dir=None, filename="_%s.rollup.con
     output_format: passed to rollup output.format option, e.g. "umd"
 
   Returns:
-    The rollup config file. See https://rollupjs.org/guide/en#configuration-files
+    The rollup config file as well as a module with bazel specific config. See https://rollupjs.org/guide/en#configuration-files
   """
   config = ctx.actions.declare_file(filename % ctx.label.name)
+  bazel_conf_filename = "bazel." + filename % ctx.label.name
+  bazel_config = ctx.actions.declare_file(bazel_conf_filename)
 
   # build_file_path includes the BUILD.bazel file, transform here to only include the dirname
   build_file_dirname = "/".join(ctx.build_file_path.split("/")[:-1])
@@ -72,23 +76,30 @@ def write_rollup_config(ctx, plugins=[], root_dir=None, filename="_%s.rollup.con
   ] if f])
 
   ctx.actions.expand_template(
-      output = config,
-      template =  ctx.file._rollup_config_tmpl,
+      output = bazel_config,
+      template =  ctx.file._rollup_bazel_conf_tmpl,
       substitutions = {
           "TMPL_workspace_name": ctx.workspace_name,
           "TMPL_rootDir": root_dir,
-          "TMPL_global_name": ctx.attr.global_name if ctx.attr.global_name else ctx.label.name,
-          "TMPL_module_mappings": str(mappings),
-          "TMPL_additional_plugins": ",\n".join(plugins),
           "TMPL_banner_file": "\"%s\"" % ctx.file.license_banner.path if ctx.file.license_banner else "undefined",
           "TMPL_stamp_data": "\"%s\"" % ctx.version_file.path if ctx.version_file else "undefined",
-          "TMPL_output_format": output_format,
+          "TMPL_module_mappings": str(mappings),
+          "TMPL_additional_plugins": ",\n".join(plugins),
           "TMPL_node_modules_path": node_modules_path,
       })
 
-  return config
+  ctx.actions.expand_template(
+      output = config,
+      template =  ctx.file.rollup_config_tmpl,
+      substitutions = {
+          "TMPL_global_name": ctx.attr.global_name if ctx.attr.global_name else ctx.label.name,
+          "TMPL_output_format": output_format,
+          "TMPL_bazel_rollup_conf_path": "\"./%s\"" % bazel_conf_filename.rsplit(".js", maxsplit=1)[0],
+      })
 
-def run_rollup(ctx, sources, config, output):
+  return [config, bazel_config]
+
+def run_rollup(ctx, sources, config_inputs, output):
   """Creates an Action that can run rollup on set of sources.
 
   This is also used by ng_package and ng_rollup_bundle rules in @angular/bazel.
@@ -96,7 +107,7 @@ def run_rollup(ctx, sources, config, output):
   Args:
     ctx: Bazel rule execution context
     sources: JS sources to rollup
-    config: rollup config file
+    config_inputs: rollup config inputs
     output: output file
 
   Returns:
@@ -105,7 +116,7 @@ def run_rollup(ctx, sources, config, output):
   map_output = ctx.actions.declare_file(output.basename + ".map", sibling = output)
 
   args = ctx.actions.args()
-  args.add(["--config", config.path])
+  args.add(["--config", config_inputs[0].path])
   args.add(["--output.file", output.path])
   args.add(["--output.sourcemap", "--output.sourcemapFile", map_output.path])
   args.add(["--input", ctx.attr.entry_point])
@@ -119,14 +130,14 @@ def run_rollup(ctx, sources, config, output):
   args.add("--globals")
   args.add(["%s:%s" % g for g in ctx.attr.globals.items()], join_with=",")
 
-  inputs = sources + ctx.files.node_modules + [config]
+  inputs = sources + ctx.files.node_modules + config_inputs
   if ctx.file.license_banner:
     inputs += [ctx.file.license_banner]
   if ctx.version_file:
     inputs += [ctx.version_file]
 
   ctx.actions.run(
-      executable = ctx.executable._rollup,
+      executable = ctx.executable.rollup,
       inputs = inputs,
       outputs = [output, map_output],
       arguments = [args]
@@ -236,13 +247,13 @@ def run_sourcemapexplorer(ctx, js, map, output):
   )
 
 def _rollup_bundle(ctx):
-  rollup_config = write_rollup_config(ctx)
-  run_rollup(ctx, collect_es6_sources(ctx), rollup_config, ctx.outputs.build_es6)
+  rollup_config_inputs = write_rollup_config(ctx)
+  run_rollup(ctx, collect_es6_sources(ctx), rollup_config_inputs, ctx.outputs.build_es6)
   _run_tsc(ctx, ctx.outputs.build_es6, ctx.outputs.build_es5)
   source_map = run_uglify(ctx, ctx.outputs.build_es5, ctx.outputs.build_es5_min)
   run_uglify(ctx, ctx.outputs.build_es5, ctx.outputs.build_es5_min_debug, debug = True)
-  umd_rollup_config = write_rollup_config(ctx, filename = "_%s_umd.rollup.conf.js", output_format = "umd")
-  run_rollup(ctx, collect_es6_sources(ctx), umd_rollup_config, ctx.outputs.build_umd)
+  umd_rollup_config_inputs = write_rollup_config(ctx, filename = "_%s_umd.rollup.conf.js", output_format = "umd")
+  run_rollup(ctx, collect_es6_sources(ctx), umd_rollup_config_inputs, ctx.outputs.build_umd)
   run_sourcemapexplorer(ctx, ctx.outputs.build_es5_min, source_map, ctx.outputs.explore_html)
   files = [ctx.outputs.build_es5_min, source_map]
   return DefaultInfo(files = depset(files), runfiles = ctx.runfiles(files))
@@ -286,10 +297,20 @@ ROLLUP_ATTRS = {
         Rollup doc: "The variable name, representing your iife/umd bundle, by which other scripts on the same page can access it."
 
         This is passed to the `output.name` setting in Rollup.""",),
-    "_rollup": attr.label(
+    "rollup": attr.label(
+        doc = """The rollup executable which can be overriden if a custom config is needed.""",
         executable = True,
         cfg="host",
         default = Label("@build_bazel_rules_nodejs//internal/rollup:rollup")),
+    "rollup_config_tmpl": attr.label(
+        doc = """The rollup config template which can be overriden if needed.""",
+        default = Label("@build_bazel_rules_nodejs//internal/rollup:rollup.config.js"),
+        allow_files = True,
+        single_file = True),
+    "_rollup_bazel_conf_tmpl": attr.label(
+        default = Label("@build_bazel_rules_nodejs//internal/rollup:bazel.rollup.config.js"),
+        allow_files = True,
+        single_file = True),
     "_tsc": attr.label(
         executable = True,
         cfg="host",
@@ -302,10 +323,6 @@ ROLLUP_ATTRS = {
         executable = True,
         cfg = "host",
         default = Label("@build_bazel_rules_nodejs//internal/rollup:source-map-explorer")),
-    "_rollup_config_tmpl": attr.label(
-        default = Label("@build_bazel_rules_nodejs//internal/rollup:rollup.config.js"),
-        allow_files = True,
-        single_file = True),
     "_uglify_config_tmpl": attr.label(
         default = Label("@build_bazel_rules_nodejs//internal/rollup:uglify.config.json"),
         allow_files = True,
@@ -356,3 +373,36 @@ For debugging, note that the `rollup.config.js` and `uglify.config.json` files c
 
 An example usage can be found in https://github.com/bazelbuild/rules_nodejs/tree/master/internal/e2e/rollup
 """
+
+def rollup_bundle_macro(**kwargs):
+  """rollup binary wrapper for `rollup_bundle`
+
+  This macro re-exposes the `rollup_bundle` rule with its corresponding rollup nodejs_binary
+  so it can be overriden when a custom rollup config is used.
+
+  This is re-exported in `//:defs.bzl` as `rollup_bundle` so if you load the rule
+  from there, you actually get this macro.
+
+  Args:
+    **kwargs: rollup_config_node_modules and rollup_config_entry_point is passed to the binary, everything else is passed through to `rollup_bundle`
+  """
+  node_modules = kwargs.pop('rollup_config_node_modules', "@build_bazel_rules_nodejs_rollup_deps//:node_modules")
+  entry_point = kwargs.pop('rollup_config_entry_point', "build_bazel_rules_nodejs_rollup_deps/node_modules/rollup/bin/rollup")
+
+  _nodejs_binary(
+    name = "%s_rollup" % kwargs['name'],
+    entry_point = entry_point,
+    node_modules = node_modules,
+    visibility = ["//visibility:public"]
+  )
+
+  r = native.existing_rule("%s_rollup" % kwargs['name'])
+  # In the root of the workspace bazel returns an absolute path, otherwise a relative one
+  if r['generator_location'].startswith("/"):
+    rollup = native.repository_name() + "//:" + r['name']
+  else:
+    rollup = native.repository_name() + "//" + r['generator_location'].rsplit("/", maxsplit=1)[0] + ":" + r['name']
+
+  kwargs["rollup"] = rollup
+
+  rollup_bundle(**kwargs)
